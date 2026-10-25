@@ -112,14 +112,23 @@ def extract_text(content) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         )
     return str(content)
-
 def get_llm(api_key: str, temperature: float = 0.6):
-    """Initializes the Google Gemini 3 Flash model."""
-    return ChatGoogleGenerativeAI(
-        model="gemini-3-flash-preview",
+    primary = ChatGoogleGenerativeAI(
+        model="gemini-3.8-flash",
         google_api_key=api_key,
         temperature=temperature
     )
+    backup1 = ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash-lite",
+        google_api_key=api_key,
+        temperature=temperature
+    )
+    backup2 = ChatGoogleGenerativeAI(
+        model="gemma-3-27b-it",
+        google_api_key=api_key,
+        temperature=temperature
+    )
+    return primary.with_fallbacks([backup1, backup2])
 
 def transcribe_audio(api_key: str, audio_bytes: bytes, mime_type: str) -> str:
     """Transcribes a recorded answer with the candidate's configured Gemini API key."""
