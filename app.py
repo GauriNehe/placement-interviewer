@@ -1,7 +1,9 @@
 import os
+import json
 import base64
 from typing import List
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -39,7 +41,7 @@ class InterviewScorecard(BaseModel):
     question_breakdown: List[QuestionCritique] = Field(description="Detailed critique and model answer for each of the 5 questions")
 
 
-# 3. Helper to Clean Model Output Text
+# 3. Helper to Clean Model Output Text & Speak Out Loud (Zero-Lag Browser TTS)
 def extract_clean_text(content) -> str:
     """Safely extracts plain string from string or list-based model outputs."""
     if isinstance(content, str):
@@ -55,7 +57,28 @@ def extract_clean_text(content) -> str:
     return str(content).strip()
 
 
-# 4. Fast LLM Initializer with Instant Quota Fallbacks
+def speak_interviewer_text(text: str):
+    """Uses the browser's native Web Speech API to speak the interviewer's question with zero server delay."""
+    clean_for_speech = text.replace("`", "").replace("*", "").replace("#", "")
+    safe_json_text = json.dumps(clean_for_speech)
+    components.html(
+        f"""
+        <script>
+            if ('speechSynthesis' in window) {{
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance({safe_json_text});
+                utterance.lang = 'en-US';
+                utterance.rate = 1.02;
+                utterance.pitch = 1.0;
+                window.speechSynthesis.speak(utterance);
+            }}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 # 4. Fast LLM Initializer with Instant Quota Fallbacks
 def get_llm(api_key: str, temperature: float = 0.6):
     """Initializes Gemini with fast failovers so 429 quota limits never hang the app."""
@@ -82,9 +105,10 @@ def get_llm(api_key: str, temperature: float = 0.6):
     )
     return primary.with_fallbacks([backup1, backup2])
 
-# 5. Ultra-Fast In-Memory Voice Transcription (< 1.5s)
+
+# 5. Ultra-Fast In-Memory Voice Transcription (< 1.5s) for Interviewee
 def transcribe_voice_fast(audio_bytes: bytes, api_key: str) -> str:
-    """Transcribes audio bytes directly in memory without slow file uploads."""
+    """Transcribes candidate audio bytes directly in memory without slow file uploads."""
     llm = get_llm(api_key=api_key, temperature=0.0)
     b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
     
@@ -181,6 +205,8 @@ if "question_count" not in st.session_state:
     st.session_state.question_count = 0
 if "scorecard" not in st.session_state:
     st.session_state.scorecard = None
+if "last_spoken_index" not in st.session_state:
+    st.session_state.last_spoken_index = -1
 
 chat_history = StreamlitChatMessageHistory(key="langchain_messages")
 
@@ -233,6 +259,8 @@ with st.sidebar:
         value="Core fundamentals, problem-solving, and practical scenarios"
     )
     
+    enable_interviewer_voice = st.toggle("🔊 Auto-Speak Interviewer Questions", value=True)
+    
     col1, col2 = st.columns(2)
     with col1:
         start_btn = st.button("🚀 Start", use_container_width=True, type="primary")
@@ -245,6 +273,7 @@ with st.sidebar:
         st.session_state.interview_completed = False
         st.session_state.question_count = 0
         st.session_state.scorecard = None
+        st.session_state.last_spoken_index = -1
         st.rerun()
 
     if start_btn:
@@ -256,6 +285,7 @@ with st.sidebar:
             st.session_state.interview_completed = False
             st.session_state.question_count = 1
             st.session_state.scorecard = None
+            st.session_state.last_spoken_index = -1
             
             with st.spinner("Starting your technical interview..."):
                 try:
@@ -268,7 +298,6 @@ with st.sidebar:
                         {"input": opening_instruction, "role": role, "experience": experience, "focus_areas": focus_areas},
                         config={"configurable": {"session_id": "placement_session"}}
                     )
-                    # Replace the hidden trigger prompt in history so only the AI greeting shows first
                     if len(chat_history.messages) >= 2:
                         ai_opening = chat_history.messages[-1]
                         chat_history.clear()
@@ -282,7 +311,7 @@ with st.sidebar:
 # 10. Main Application UI
 st.title("🎓 Technical Interview Live Simulator & Feedback Scoring Coach")
 st.markdown(
-    f"**Role:** `{role}` | **Level:** `{experience}` | **Format:** `5-Turn Adaptive Technical Dialogue`"
+    f"**Role:** `{role}` | **Level:** `{experience}` | **Format:** `2-Way Voice + Text Adaptive Interview`"
 )
 
 if not st.session_state.interview_active and not st.session_state.interview_completed:
@@ -295,10 +324,25 @@ if st.session_state.interview_active:
     st.progress(q_num / 5.0)
 
 # Render Conversation Transcript
-for msg in chat_history.messages:
+for idx, msg in enumerate(chat_history.messages):
     role_label = "assistant" if msg.type == "ai" else "user"
     with st.chat_message(role_label):
-        st.markdown(extract_clean_text(msg.content))
+        clean_msg = extract_clean_text(msg.content)
+        st.markdown(clean_msg)
+        # Add a manual replay button on the latest interviewer question
+        if msg.type == "ai" and idx == len(chat_history.messages) - 1:
+            if st.button("🔊 Replay Interviewer Voice", key=f"replay_{idx}"):
+                speak_interviewer_text(clean_msg)
+
+# Auto-speak new interviewer message once when it arrives
+if (
+    enable_interviewer_voice
+    and len(chat_history.messages) > 0
+    and chat_history.messages[-1].type == "ai"
+    and st.session_state.last_spoken_index != len(chat_history.messages) - 1
+):
+    st.session_state.last_spoken_index = len(chat_history.messages) - 1
+    speak_interviewer_text(extract_clean_text(chat_history.messages[-1].content))
 
 
 # 11. Handle Candidate Answer (Text OR Fast Voice Input)
@@ -318,16 +362,14 @@ def process_candidate_answer(user_answer: str):
                 {"input": prompt_with_guidance, "role": role, "experience": experience, "focus_areas": focus_areas},
                 config={"configurable": {"session_id": "placement_session"}}
             )
-            # Store clean user message in UI history instead of system note wrapper
             chat_history.messages[-2].content = user_answer
             chat_history.messages[-1].content = extract_clean_text(response.content)
             st.session_state.question_count = next_q
             st.rerun()
     else:
-        # Final 5th answer received -> Wrap up and evaluate
         chat_history.add_user_message(user_answer)
         chat_history.add_ai_message(
-            "Thank you for completing all 5 questions! Generating your detailed Evaluation Scorecard below..."
+            "Thank you for completing all 5 questions! Generating your detailed Evaluation Scorecard below."
         )
         st.session_state.interview_active = False
         st.session_state.interview_completed = True
@@ -337,9 +379,9 @@ def process_candidate_answer(user_answer: str):
 if st.session_state.interview_active:
     q_num = st.session_state.question_count
     
-    # Dynamic key ensures the audio recorder resets cleanly on each new question
+    # Interviewee Voice Input (Speech-to-Text)
     audio_val = st.audio_input(
-        f"🎙️ Record voice answer for Question {q_num} (or type below):",
+        f"🎙️ Interviewee Voice: Record your answer for Question {q_num} (or type below):",
         key=f"voice_q_{q_num}"
     )
     text_val = st.chat_input(f"Type your answer for Question {q_num}...")
