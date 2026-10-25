@@ -1,10 +1,14 @@
 import os
+import base64
+import hashlib
+import io
 import streamlit as st
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from typing import List
 
 # LangChain & Gemini Imports
+from google import genai
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -16,7 +20,7 @@ load_dotenv()
 
 # 2. Configure the Streamlit Web Page
 st.set_page_config(
-    page_title="Technical Interview Live Simulator & Coach",
+    page_title="AI Technical Placement Interviewer",
     page_icon="🎓",
     layout="wide"
 )
@@ -33,20 +37,24 @@ MAX_TURNS = 5
 # and structured model answers that we can neatly display in Streamlit.
 
 class QuestionReview(BaseModel):
-    question_number: int = Field(description="Question number (1 to 5)")
+    question_number: int = Field(ge=1, le=MAX_TURNS, description="Question number (1 to 5)")
     question_asked: str = Field(description="The exact technical question asked by the interviewer")
     candidate_answer_summary: str = Field(description="Brief summary of the candidate's response")
     critique: str = Field(description="Constructive feedback on what was good and what was missing")
     model_answer: str = Field(description="Ideal, comprehensive technical answer expected in a placement interview")
 
 class EvaluationScorecard(BaseModel):
-    communication_score: int = Field(description="Score out of 10 for clarity, structure, and articulation")
-    technical_depth_score: int = Field(description="Score out of 10 for conceptual accuracy and deep understanding")
-    problem_solving_score: int = Field(description="Score out of 10 for analytical thinking, edge cases, and trade-offs")
+    communication_score: int = Field(ge=0, le=10, description="Score out of 10 for clarity, structure, and articulation")
+    technical_depth_score: int = Field(ge=0, le=10, description="Score out of 10 for conceptual accuracy and deep understanding")
+    problem_solving_score: int = Field(ge=0, le=10, description="Score out of 10 for analytical thinking, edge cases, and trade-offs")
     overall_summary: str = Field(description="Overall executive summary of the candidate's interview performance")
     key_strengths: List[str] = Field(description="Top 2-3 strengths demonstrated")
     areas_for_improvement: List[str] = Field(description="Top 2-3 areas to study before campus placements")
-    question_reviews: List[QuestionReview] = Field(description="Detailed breakdown and model answers for each of the 5 questions")
+    question_reviews: List[QuestionReview] = Field(
+        min_length=MAX_TURNS,
+        max_length=MAX_TURNS,
+        description="Detailed breakdown and model answers for each of the 5 questions"
+    )
 
 
 # =====================================================================
@@ -64,6 +72,28 @@ if "turn_count" not in st.session_state:
     st.session_state.turn_count = 0
 if "scorecard" not in st.session_state:
     st.session_state.scorecard = None
+if "interview_role" not in st.session_state:
+    st.session_state.interview_role = None
+if "interview_experience" not in st.session_state:
+    st.session_state.interview_experience = None
+if "interview_focus" not in st.session_state:
+    st.session_state.interview_focus = None
+if "pending_answer" not in st.session_state:
+    st.session_state.pending_answer = None
+if "interview_error" not in st.session_state:
+    st.session_state.interview_error = None
+if "scorecard_error" not in st.session_state:
+    st.session_state.scorecard_error = None
+if "interviewer_audio" not in st.session_state:
+    st.session_state.interviewer_audio = {}
+if "voice_output_enabled" not in st.session_state:
+    st.session_state.voice_output_enabled = True
+if "voice_output_error" not in st.session_state:
+    st.session_state.voice_output_error = None
+if "voice_input_error" not in st.session_state:
+    st.session_state.voice_input_error = None
+if "last_processed_audio_hash" not in st.session_state:
+    st.session_state.last_processed_audio_hash = None
 
 # Initialize LangChain's Streamlit-native memory store
 msgs = StreamlitChatMessageHistory(key="langchain_messages")
@@ -91,6 +121,52 @@ def get_llm(api_key: str, temperature: float = 0.6):
         temperature=temperature
     )
 
+def transcribe_audio(api_key: str, audio_bytes: bytes, mime_type: str) -> str:
+    """Transcribes a recorded answer with the candidate's configured Gemini API key."""
+    client = genai.Client(api_key=api_key)
+    audio_file = client.files.upload(
+        file=io.BytesIO(audio_bytes),
+        config={"mime_type": mime_type}
+    )
+    try:
+        interaction = client.interactions.create(
+            model="gemini-3.5-transcribe",
+            input=[{
+                "type": "audio",
+                "uri": audio_file.uri,
+                "mime_type": audio_file.mime_type
+            }]
+        )
+    finally:
+        client.files.delete(name=audio_file.name)
+    transcript = (interaction.output_text or "").strip()
+    if not transcript:
+        raise ValueError("Gemini did not return a transcription. Please try recording again.")
+    return transcript
+
+def generate_speech(api_key: str, text: str) -> bytes:
+    """Creates a WAV audio response using Gemini text-to-speech."""
+    client = genai.Client(api_key=api_key)
+    interaction = client.interactions.create(
+        model="gemini-3.8-flash-tts",
+        input=[{
+            "type": "user_input",
+            "content": [{
+                "type": "text",
+                "text": text,
+                "annotations": [{
+                    "type": "speech_metadata",
+                    "style": "Clear, professional, and encouraging."
+                }]
+            }]
+        }],
+        response_format={"type": "audio"},
+        generation_config={"speech_config": [{"voice": "Kore"}]}
+    )
+    if not interaction.output_audio or not interaction.output_audio.data:
+        raise ValueError("Gemini did not return spoken audio.")
+    return base64.b64decode(interaction.output_audio.data)
+
 def build_interview_chain(api_key: str, role: str, experience: str, focus_topics: str):
     """Builds the conversational AI chain with memory for the 5-turn interview."""
     llm = get_llm(api_key, temperature=0.6)
@@ -101,13 +177,14 @@ Candidate Experience Level: {experience}
 Core Topics to Cover: {focus_topics}
 
 INTERVIEW RULES:
-1. You are conducting an adaptive {MAX_TURNS}-question technical interview.
+1. You are conducting an adaptive {MAX_TURNS}-question technical interview. The candidate's first question is already in the conversation.
 2. Ask ONLY ONE question at a time. Keep your tone professional, encouraging, yet rigorous.
 3. ADAPTIVE FOLLOW-UPS: Analyze the candidate's previous answer carefully:
    - If their answer is strong, probe deeper into edge cases, scalability, or real-world trade-offs.
    - If their answer is vague, partially incorrect, or brief, ask a clarifying follow-up or pivot to assess foundational understanding.
 4. Do NOT provide the full answer or lecture the candidate during the interview—save feedback for the final evaluation.
-5. Briefly acknowledge their answer in 1 sentence before asking the next question.
+5. Briefly acknowledge their answer in 1 sentence before asking the next question. Do not add a second question or a multi-part list.
+6. Keep every question appropriate to the target role and stated years of experience.
 """
 
     # Combine system instructions, chat history, and latest user input
@@ -144,6 +221,7 @@ def generate_scorecard(api_key: str, role: str, experience: str) -> EvaluationSc
     eval_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are an expert Campus Placement Evaluation Coach.
 Analyze the following technical interview transcript and generate a strict, constructive, and comprehensive Evaluation Scorecard.
+Score each category from 0 to 10 inclusive. Include exactly five question reviews, numbered 1 through 5, each with a role-appropriate model answer.
 {format_instructions}"""),
         ("human", """Target Role: {role}
 Experience Level: {experience}
@@ -164,11 +242,24 @@ Evaluate the candidate fairly based on their target experience level and return 
 
 def reset_interview():
     """Clears chat memory and resets all counters to start fresh."""
+    for key in list(st.session_state):
+        if key.startswith(("candidate_audio_", "answer_draft_")):
+            del st.session_state[key]
     msgs.clear()
     st.session_state.interview_active = False
     st.session_state.interview_completed = False
     st.session_state.turn_count = 0
     st.session_state.scorecard = None
+    st.session_state.interview_role = None
+    st.session_state.interview_experience = None
+    st.session_state.interview_focus = None
+    st.session_state.pending_answer = None
+    st.session_state.interview_error = None
+    st.session_state.scorecard_error = None
+    st.session_state.interviewer_audio = {}
+    st.session_state.voice_output_error = None
+    st.session_state.voice_input_error = None
+    st.session_state.last_processed_audio_hash = None
 
 
 # =====================================================================
@@ -188,6 +279,7 @@ with st.sidebar:
 
     st.divider()
 
+    setup_locked = st.session_state.interview_active or st.session_state.interview_completed
     role_options = [
         "Backend Developer",
         "Cloud Engineer",
@@ -201,26 +293,30 @@ with st.sidebar:
     selected_role = st.selectbox(
         "🎯 Target Role",
         options=role_options,
-        disabled=st.session_state.interview_active
+        disabled=setup_locked
     )
 
-    experience_options = [
-        "Fresher / Final Year Student (0 yrs)",
-        "Internship Experience (0 - 1 yr)",
-        "Early Career (1 - 2 yrs)",
-        "Experienced (2+ yrs)"
-    ]
-    selected_exp = st.selectbox(
-        "📈 Experience Level",
-        options=experience_options,
-        disabled=st.session_state.interview_active
+    selected_exp = st.number_input(
+        "📈 Years of experience",
+        min_value=0,
+        max_value=40,
+        value=0,
+        step=1,
+        disabled=setup_locked,
+        help="Use 0 for a student or new graduate."
     )
 
     focus_topics = st.text_input(
         "🛠️ Optional Focus Areas",
         placeholder="e.g., Python, SQL, AWS, System Design, DSA",
         value="Core fundamentals, problem-solving, and practical scenarios",
-        disabled=st.session_state.interview_active
+        disabled=setup_locked
+    )
+    voice_output_enabled = st.checkbox(
+        "🔊 Speak interviewer questions",
+        value=True,
+        disabled=setup_locked,
+        help="Uses Gemini text-to-speech with your configured API key."
     )
 
     st.divider()
@@ -231,7 +327,7 @@ with st.sidebar:
             "🚀 Start",
             type="primary",
             use_container_width=True,
-            disabled=st.session_state.interview_active or not api_key
+            disabled=setup_locked or not api_key
         )
     with col2:
         reset_btn = st.button(
@@ -246,89 +342,208 @@ with st.sidebar:
     # Trigger Question 1 when the user clicks Start
     if start_btn and api_key:
         reset_interview()
-        st.session_state.interview_active = True
-        st.session_state.turn_count = 1
+        st.session_state.interview_role = selected_role
+        st.session_state.interview_experience = selected_exp
+        st.session_state.interview_focus = focus_topics
+        st.session_state.voice_output_enabled = voice_output_enabled
 
+        start_succeeded = False
         with st.spinner("Interviewer is preparing Question 1..."):
-            chain = build_interview_chain(api_key, selected_role, selected_exp, focus_topics)
-            chain.invoke(
-                {"input": f"START_INTERVIEW_SESSION: Greet the candidate briefly and ask Question 1 of {MAX_TURNS} for the {selected_role} interview."},
-                config={"configurable": {"session_id": "placement_session"}}
-            )
-        st.rerun()
+            try:
+                chain = build_interview_chain(api_key, selected_role, f"{selected_exp} years", focus_topics)
+                chain.invoke(
+                    {"input": f"START_INTERVIEW_SESSION: Greet the candidate briefly and ask Question 1 of {MAX_TURNS} for the {selected_role} interview."},
+                    config={"configurable": {"session_id": "placement_session"}}
+                )
+                if voice_output_enabled:
+                    try:
+                        st.session_state.interviewer_audio[len(msgs.messages) - 1] = generate_speech(
+                            api_key,
+                            extract_text(msgs.messages[-1].content)
+                        )
+                    except Exception as exc:
+                        st.session_state.voice_output_error = f"Could not create spoken interviewer audio: {exc}"
+                st.session_state.interview_active = True
+                st.session_state.turn_count = 1
+                start_succeeded = True
+            except Exception as exc:
+                st.session_state.interview_error = f"Could not start the interview: {exc}"
+        if start_succeeded:
+            st.rerun()
 
 
 # =====================================================================
 # PART E: MAIN CHAT INTERFACE & 5-TURN LOOP
 # =====================================================================
-st.title("🎓 Technical Interview Live Simulator & Feedback Coach")
 st.markdown(
-    f"**Role:** `{selected_role}` | **Level:** `{selected_exp}` | **Format:** `5-Turn Adaptive Technical Dialogue`"
+    """
+    <style>
+    .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1180px;}
+    [data-testid="stMetric"] {background: rgba(127, 127, 127, 0.08); padding: 1rem; border-radius: 0.8rem;}
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
-if not api_key:
-    st.info("👈 Please enter your **Google Gemini API Key** in the sidebar and click **Start** to begin your mock placement interview.")
+role_label = st.session_state.interview_role or selected_role
+experience_label = st.session_state.interview_experience
+st.title("Technical Placement Interviewer")
+st.markdown(
+    "Practice a realistic, adaptive technical interview and get actionable feedback with model answers."
+)
+
+if not api_key and st.session_state.scorecard is None:
+    st.info("Add your Google Gemini API key in the sidebar to start your mock interview.")
     st.stop()
 
 if not st.session_state.interview_active and not st.session_state.interview_completed:
-    st.info("👈 Configure your target role and experience level in the sidebar, then click **🚀 Start** to launch your live technical interview.")
+    if st.session_state.interview_error:
+        st.error(st.session_state.interview_error)
+    st.info("Choose a target role and your years of experience in the sidebar, then select **Start**.")
     st.stop()
 
-# Visual Progress Bar (Question 1 to 5)
-progress_val = min(st.session_state.turn_count / MAX_TURNS, 1.0)
-if st.session_state.interview_completed:
-    st.progress(1.0, text="✅ Interview Completed! View your Evaluation Scorecard below.")
-else:
-    st.progress(progress_val, text=f"📍 Question {st.session_state.turn_count} of {MAX_TURNS}")
+st.markdown(
+    f"**{role_label}** &nbsp; · &nbsp; {experience_label} years of experience "
+    f"&nbsp; · &nbsp; {MAX_TURNS}-question adaptive interview"
+)
 
-# Render Existing Chat Messages
+if st.session_state.interview_completed:
+    st.progress(1.0, text="Interview completed")
+else:
+    st.progress(
+        min(st.session_state.turn_count / MAX_TURNS, 1.0),
+        text=f"Question {st.session_state.turn_count} of {MAX_TURNS}"
+    )
+
+if st.session_state.voice_output_error:
+    st.warning(st.session_state.voice_output_error)
+
 chat_container = st.container()
 with chat_container:
-    for msg in msgs.messages:
+    for index, msg in enumerate(msgs.messages):
         clean_text = extract_text(msg.content)
         if "START_INTERVIEW_SESSION" in clean_text:
             continue
         avatar = "🧑‍💻" if msg.type == "human" else "👔"
-        with st.chat_message(msg.type, avatar=avatar):
+        role = "user" if msg.type == "human" else "assistant"
+        with st.chat_message(role, avatar=avatar):
             st.markdown(clean_text)
+            if msg.type == "ai" and index in st.session_state.interviewer_audio:
+                st.audio(st.session_state.interviewer_audio[index], format="audio/wav")
 
-# Accept Student Answer
+    if st.session_state.pending_answer:
+        with st.chat_message("user", avatar="🧑‍💻"):
+            st.markdown(st.session_state.pending_answer)
+
 if st.session_state.interview_active and not st.session_state.interview_completed:
-    user_answer = st.chat_input(f"Type your answer for Question {st.session_state.turn_count}...")
+    turn_number = st.session_state.turn_count
+    audio_key = f"candidate_audio_{turn_number}"
+    draft_key = f"answer_draft_{turn_number}"
 
-    if user_answer:
-        with chat_container:
-            with st.chat_message("human", avatar="🧑‍💻"):
-                st.markdown(user_answer)
+    st.caption(
+        "Record an answer or type it below. Recordings are uploaded to Gemini for transcription and deleted afterward."
+    )
+    recorded_audio = st.audio_input(
+        "Record your answer",
+        sample_rate=16000,
+        key=audio_key
+    )
+    if recorded_audio:
+        audio_bytes = recorded_audio.getvalue()
+        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+        if audio_hash != st.session_state.last_processed_audio_hash:
+            st.session_state.last_processed_audio_hash = audio_hash
+            st.session_state.voice_input_error = None
+            try:
+                with st.spinner("Transcribing your answer..."):
+                    transcript = transcribe_audio(
+                        api_key,
+                        audio_bytes,
+                        recorded_audio.type or "audio/wav"
+                    )
+                st.session_state[draft_key] = transcript
+                st.rerun()
+            except Exception as exc:
+                st.session_state.voice_input_error = f"Could not transcribe the recording: {exc}"
 
-        # If turns 1 through 4: generate the next adaptive question
-        if st.session_state.turn_count < MAX_TURNS:
-            st.session_state.turn_count += 1
-            next_q_num = st.session_state.turn_count
-
-            with st.spinner(f"Analyzing response & formulating Question {next_q_num} of {MAX_TURNS}..."):
-                chain = build_interview_chain(api_key, selected_role, selected_exp, focus_topics)
-                prompt_with_directive = (
-                    f"{user_answer}\n\n"
-                    f"[System Note: That was the candidate's response to Question {next_q_num - 1}. "
-                    f"Now ask Question {next_q_num} of {MAX_TURNS}. Make it an adaptive follow-up based on their answer or probe a new relevant technical concept.]"
-                )
-                chain.invoke(
-                    {"input": prompt_with_directive},
-                    config={"configurable": {"session_id": "placement_session"}}
-                )
-                # Keep history clean by removing the system note after invocation
-                msgs.messages[-2].content = user_answer
-
+    if st.session_state.voice_input_error:
+        st.error(st.session_state.voice_input_error)
+        if st.button("Retry voice transcription"):
+            st.session_state.last_processed_audio_hash = None
+            st.session_state.voice_input_error = None
             st.rerun()
 
-        # If turn 5 (final question answered): end interview and trigger scorecard
-        else:
-            msgs.add_user_message(user_answer)
-            msgs.add_ai_message(
-                "Thank you for completing all 5 questions of the technical interview! "
-                "Please wait a moment while I compile your comprehensive Evaluation Scorecard and model answers."
+    retry_clicked = False
+    if st.session_state.interview_error:
+        st.error(st.session_state.interview_error)
+        retry_clicked = st.button("Retry sending your answer", type="primary")
+
+    answer_text = st.text_area(
+        "Your answer (you can edit the transcript)",
+        key=draft_key,
+        height=140,
+        placeholder="Type your answer here, or record it above."
+    )
+    submit_clicked = st.button(
+        "Submit answer",
+        type="primary",
+        disabled=not answer_text.strip() or bool(st.session_state.interview_error)
+    )
+    if submit_clicked:
+        st.session_state.pending_answer = answer_text.strip()
+
+    should_process = bool(st.session_state.pending_answer) and (
+        submit_clicked or retry_clicked
+    )
+    if should_process:
+        answer = st.session_state.pending_answer
+
+        if st.session_state.turn_count < MAX_TURNS:
+            next_q_num = st.session_state.turn_count + 1
+            prompt_with_directive = (
+                f"{answer}\n\n"
+                f"[System Note: That was the candidate's response to Question "
+                f"{st.session_state.turn_count}. Now ask Question {next_q_num} "
+                f"of {MAX_TURNS}. Make it an adaptive follow-up based on their "
+                "answer or probe a new relevant technical concept. Ask exactly one question.]"
             )
+            try:
+                with st.spinner(f"Reviewing your answer and preparing Question {next_q_num}..."):
+                    chain = build_interview_chain(
+                        api_key,
+                        role_label,
+                        f"{experience_label} years",
+                        st.session_state.interview_focus
+                    )
+                    chain.invoke(
+                        {"input": prompt_with_directive},
+                        config={"configurable": {"session_id": "placement_session"}}
+                    )
+                msgs.messages[-2].content = answer
+                if st.session_state.voice_output_enabled:
+                    try:
+                        st.session_state.interviewer_audio[len(msgs.messages) - 1] = generate_speech(
+                            api_key,
+                            extract_text(msgs.messages[-1].content)
+                        )
+                        st.session_state.voice_output_error = None
+                    except Exception as exc:
+                        st.session_state.voice_output_error = (
+                            f"Could not create spoken interviewer audio: {exc}"
+                        )
+                st.session_state.turn_count = next_q_num
+                st.session_state.pending_answer = None
+                st.session_state.interview_error = None
+                st.session_state.last_processed_audio_hash = None
+            except Exception as exc:
+                st.session_state.interview_error = f"Could not generate the next question: {exc}"
+            st.rerun()
+        else:
+            msgs.add_user_message(answer)
+            msgs.add_ai_message(
+                "Thank you for completing all five questions. Your scorecard and model answers are being prepared."
+            )
+            st.session_state.pending_answer = None
             st.session_state.interview_active = False
             st.session_state.interview_completed = True
             st.rerun()
@@ -339,49 +554,65 @@ if st.session_state.interview_active and not st.session_state.interview_complete
 # =====================================================================
 if st.session_state.interview_completed:
     st.divider()
-    st.header("📊 Comprehensive Evaluation Scorecard")
+    st.header("Evaluation Scorecard")
 
-    if st.session_state.scorecard is None:
-        with st.spinner("🧠 Evaluating your technical depth, problem-solving, and communication skills..."):
+    retry_scorecard = False
+    if st.session_state.scorecard_error:
+        st.error(st.session_state.scorecard_error)
+        retry_scorecard = st.button("Retry scorecard")
+
+    if st.session_state.scorecard is None and not st.session_state.scorecard_error:
+        retry_scorecard = True
+
+    if retry_scorecard and st.session_state.scorecard is None:
+        if not api_key:
+            st.error("Enter your Gemini API key in the sidebar to generate the scorecard.")
+        else:
             try:
-                st.session_state.scorecard = generate_scorecard(api_key, selected_role, selected_exp)
-            except Exception as e:
-                st.error(f"Error generating scorecard: {e}")
-                st.stop()
+                with st.spinner("Evaluating your interview and preparing model answers..."):
+                    st.session_state.scorecard = generate_scorecard(
+                        api_key,
+                        role_label,
+                        f"{experience_label} years"
+                    )
+                st.session_state.scorecard_error = None
+            except Exception as exc:
+                st.session_state.scorecard_error = f"Could not generate the scorecard: {exc}"
+            st.rerun()
 
-    sc: EvaluationScorecard = st.session_state.scorecard
+    if st.session_state.scorecard is not None:
+        sc: EvaluationScorecard = st.session_state.scorecard
+        avg_score = round(
+            (sc.communication_score + sc.technical_depth_score + sc.problem_solving_score) / 3,
+            1
+        )
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Communication", f"{sc.communication_score} / 10")
+        metric_columns[1].metric("Technical Depth", f"{sc.technical_depth_score} / 10")
+        metric_columns[2].metric("Problem-Solving", f"{sc.problem_solving_score} / 10")
+        metric_columns[3].metric("Overall Rating", f"{avg_score} / 10")
 
-    # 1. Display Top-Level Score Cards (Out of 10)
-    avg_score = round((sc.communication_score + sc.technical_depth_score + sc.problem_solving_score) / 3, 1)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🗣️ Communication", f"{sc.communication_score} / 10")
-    m2.metric("⚙️ Technical Depth", f"{sc.technical_depth_score} / 10")
-    m3.metric("🧩 Problem-Solving", f"{sc.problem_solving_score} / 10")
-    m4.metric("🏆 Overall Rating", f"{avg_score} / 10")
+        st.subheader("Overall feedback")
+        st.info(sc.overall_summary)
 
-    # 2. Executive Summary
-    st.subheader("📝 Executive Summary")
-    st.info(sc.overall_summary)
+        strengths_col, improvements_col = st.columns(2)
+        with strengths_col:
+            st.markdown("#### Key strengths")
+            for strength in sc.key_strengths:
+                st.markdown(f"- {strength}")
+        with improvements_col:
+            st.markdown("#### Areas to improve")
+            for improvement in sc.areas_for_improvement:
+                st.markdown(f"- {improvement}")
 
-    # 3. Strengths & Areas for Improvement
-    col_str, col_imp = st.columns(2)
-    with col_str:
-        st.success("### ✅ Key Strengths")
-        for s in sc.key_strengths:
-            st.markdown(f"- {s}")
-
-    with col_imp:
-        st.warning("### 🎯 Areas for Improvement")
-        for imp in sc.areas_for_improvement:
-            st.markdown(f"- {imp}")
-
-    # 4. Expandable Question-by-Question Review & Model Answers
-    st.divider()
-    st.subheader("🔍 Question-by-Question Breakdown & Model Answers")
-
-    for qr in sc.question_reviews:
-        with st.expander(f"Question {qr.question_number}: {qr.question_asked}", expanded=(qr.question_number == 1)):
-            st.markdown(f"**🗣️ Your Answer Summary:**\n> {qr.candidate_answer_summary}")
-            st.markdown(f"**⚖️ Panelist Critique:**\n{qr.critique}")
-            st.markdown("**💡 Ideal Model Answer:**")
-            st.success(qr.model_answer)
+        st.divider()
+        st.subheader("Question-by-question review")
+        for review in sc.question_reviews:
+            with st.expander(
+                f"Question {review.question_number}: {review.question_asked}",
+                expanded=review.question_number == 1
+            ):
+                st.markdown(f"**Your answer:** {review.candidate_answer_summary}")
+                st.markdown(f"**Feedback:** {review.critique}")
+                st.markdown("**Model answer**")
+                st.success(review.model_answer)
