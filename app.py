@@ -56,17 +56,18 @@ def extract_clean_text(content) -> str:
 
 
 # 4. Fast LLM Initializer with Instant Quota Fallbacks
+# 4. Fast LLM Initializer with Instant Quota Fallbacks
 def get_llm(api_key: str, temperature: float = 0.6):
     """Initializes Gemini with fast failovers so 429 quota limits never hang the app."""
     primary = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         google_api_key=api_key,
         temperature=temperature,
         max_retries=1,
         timeout=15
     )
     backup1 = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         google_api_key=api_key,
         temperature=temperature,
         max_retries=1,
@@ -80,7 +81,6 @@ def get_llm(api_key: str, temperature: float = 0.6):
         timeout=15
     )
     return primary.with_fallbacks([backup1, backup2])
-
 
 # 5. Ultra-Fast In-Memory Voice Transcription (< 1.5s)
 def transcribe_voice_fast(audio_bytes: bytes, api_key: str) -> str:
